@@ -5,7 +5,7 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="1.1.1"
+readonly SCRIPT_VERSION="1.1.2"
 readonly TOTAL_STAGES=7
 readonly SPEEDTEST_VERSION="1.2.0"
 readonly SPEEDTEST_X86_SHA256="5690596c54ff9bed63fa3732f818a05dbc2db19ad36ed68f21ca5f64d5cfeeb7"
@@ -666,6 +666,37 @@ print_section() {
   fi
 }
 
+print_stress_summary() {
+  local max_temp=""
+  printf '\n%s%s%s\n' "$C_BOLD" '6. Нагрузочный тест' "$C_RESET"
+  line
+
+  if [[ "$SKIP_STRESS" == "1" ]]; then
+    printf 'Результат: тест отключён.\n'
+    return
+  fi
+  if grep -q 'successful run completed' "$STRESS_REPORT" 2>/dev/null; then
+    printf 'Результат: успешно, отклонений stress-ng не обнаружено.\n'
+  else
+    printf 'Результат: тест не завершился успешно. Смотрите итог диагностики выше.\n'
+  fi
+  printf 'Нагрузка: все доступные CPU, 25%% RAM, до 256 MiB диска.\n'
+  printf 'Продолжительность: %s секунд.\n' "$STRESS_SECONDS"
+
+  max_temp="$(cat "$TEMP_MAX_FILE" 2>/dev/null || true)"
+  if [[ "$max_temp" =~ ^[0-9]+$ ]] && (( max_temp > 0 )); then
+    printf 'Максимальная температура: %s°C.\n' "$max_temp"
+  else
+    printf 'Температура: датчик недоступен внутри ВМ.\n'
+  fi
+
+  if grep -Eqi 'out of memory|oom-killer|killed process|hardware error|i/o error|segfault|mce:' "$KERNEL_NEW" 2>/dev/null; then
+    printf 'Сообщения ядра: обнаружена критическая ошибка; описание приведено в итоге диагностики.\n'
+  else
+    printf 'Сообщения ядра: критических ошибок во время нагрузки не обнаружено.\n'
+  fi
+}
+
 print_conclusions() {
   local item type text wanted
   local ok_count=0 warn_count=0 fail_count=0
@@ -938,9 +969,7 @@ main() {
   print_section "4. MTR IPv6 — $GOOGLE_IPV6" "$MTR6_REPORT"
   if [[ -s "$MTR6_ERROR" ]]; then print_section "Ошибки MTR IPv6" "$MTR6_ERROR"; fi
   print_section "5. Локально открытые порты" "$PORTS_REPORT"
-  print_section "6. Нагрузочный тест" "$STRESS_REPORT"
-  if [[ -s "$STRESS_ERROR" ]]; then print_section "Ошибки нагрузочного теста" "$STRESS_ERROR"; fi
-  if [[ -s "$KERNEL_NEW" ]]; then print_section "Новые сообщения ядра во время нагрузки" "$KERNEL_NEW"; fi
+  print_stress_summary
   print_section "7. IP-регион и доступность сервисов" "$IPREGION_REPORT"
   if [[ -s "$IPREGION_ERROR" ]]; then print_section "Сообщения ipregion" "$IPREGION_ERROR"; fi
 
