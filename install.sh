@@ -5,8 +5,8 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="1.0.0"
-readonly TOTAL_STAGES=7
+readonly SCRIPT_VERSION="1.1.0"
+readonly TOTAL_STAGES=7ссс
 readonly SPEEDTEST_VERSION="1.2.0"
 readonly SPEEDTEST_X86_SHA256="5690596c54ff9bed63fa3732f818a05dbc2db19ad36ed68f21ca5f64d5cfeeb7"
 readonly SPEEDTEST_ARM_SHA256="3953d231da3783e2bf8904b6dd72767c5c6e533e163d3742fd0437affa431bd3"
@@ -586,6 +586,22 @@ analyze_stress() {
   fi
 }
 
+curl_supports_json() {
+  curl --help all 2>/dev/null | grep -q -- '--json'
+}
+
+patch_ipregion_for_legacy_curl() {
+  local script="$1"
+  # shellcheck disable=SC2016
+  local old_line='curl_args+=(--json "$json")'
+  # shellcheck disable=SC2016
+  local new_line='curl_args+=(-H "Content-Type: application/json" --data "$json")'
+
+  grep -Fq -- "$old_line" "$script" || return 1
+  sed -i "s|${old_line}|${new_line}|" "$script" || return 1
+  grep -Fq -- "$new_line" "$script"
+}
+
 run_ipregion() {
   local script="$WORK_DIR/ipregion.sh"
   local cmd
@@ -597,24 +613,45 @@ run_ipregion() {
   done
   wget -qO "$script" "$IPREGION_URL" || return 10
   printf '%s  %s\n' "$IPREGION_SHA256" "$script" | sha256sum -c - >/dev/null 2>&1 || return 12
+  if ! curl_supports_json; then
+    patch_ipregion_for_legacy_curl "$script" || return 13
+  fi
   bash -n "$script" || return 11
   timeout_run 360 bash "$script" --json
 }
 
 format_ipregion() {
   jq -r '
-    "Внешний IPv4: \(.ipv4 // "не определён")",
-    "Внешний IPv6: \(.ipv6 // "не определён")",
+    def value:
+      if . == null or . == "" or . == "null" then "нет данных" else . end;
+    "Внешний IPv4: \((.ipv4 | value) // "не определён")",
+    "Внешний IPv6: \((.ipv6 | value) // "не определён")",
     "",
     "Основные GeoIP-проверки:",
-    (.results.primary[]? | "  \(.service): IPv4=\(.ipv4 // "нет данных"), IPv6=\(.ipv6 // "нет данных")"),
+    (.results.primary[]? | "  \(.service): IPv4=\(.ipv4 | value), IPv6=\(.ipv6 | value)"),
     "",
     "Доступность популярных сервисов:",
-    (.results.custom[]? | "  \(.service): IPv4=\(.ipv4 // "нет данных"), IPv6=\(.ipv6 // "нет данных")"),
+    (.results.custom[]? | "  \(.service): IPv4=\(.ipv4 | value), IPv6=\(.ipv6 | value)"),
     "",
     "CDN и сетевые сервисы:",
-    (.results.cdn[]? | "  \(.service): IPv4=\(.ipv4 // "нет данных"), IPv6=\(.ipv6 // "нет данных")")
+    (.results.cdn[]? | "  \(.service): IPv4=\(.ipv4 | value), IPv6=\(.ipv6 | value)")
   ' "$IPREGION_JSON" >"$IPREGION_REPORT"
+}
+
+ipregion_has_runtime_errors() {
+  [[ -s "$IPREGION_ERROR" ]] &&
+    grep -Eqi 'curl:|unknown option|not found|error|failed|timed out' "$IPREGION_ERROR"
+}
+
+ipregion_has_suspicious_values() {
+  jq -e '
+    [
+      .results[][]?
+      | (.ipv4 // empty), (.ipv6 // empty)
+      | select(type == "string" and test("^null"; "i"))
+    ]
+    | length > 0
+  ' "$IPREGION_JSON" >/dev/null 2>&1
 }
 
 print_section() {
@@ -630,23 +667,132 @@ print_section() {
 }
 
 print_conclusions() {
-  local item type text
+  local item type text wanted
   local ok_count=0 warn_count=0 fail_count=0
-  printf '\n%s%sЗаключение%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+  printf '\n%s%sИТОГ ДИАГНОСТИКИ%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
   line
   for item in "${CONCLUSIONS[@]}"; do
-    type="${item%%|*}"
-    text="${item#*|}"
-    case "$type" in
-      OK) ok "$text"; ok_count=$((ok_count + 1)) ;;
-      WARN) warn "$text"; warn_count=$((warn_count + 1)) ;;
-      FAIL) fail "$text"; fail_count=$((fail_count + 1)) ;;
+    case "${item%%|*}" in
+      OK) ok_count=$((ok_count + 1)) ;;
+      WARN) warn_count=$((warn_count + 1)) ;;
+      FAIL) fail_count=$((fail_count + 1)) ;;
     esac
   done
-  printf '\nИтого: %sнорма — %s%s, %sпредупреждения — %s%s, %sошибки — %s%s.\n' \
+  printf 'Статус: %sуспешно — %s%s  |  %sвнимание — %s%s  |  %sошибки — %s%s\n' \
     "$C_GREEN" "$ok_count" "$C_RESET" \
     "$C_YELLOW" "$warn_count" "$C_RESET" \
     "$C_RED" "$fail_count" "$C_RESET"
+  printf '\n'
+
+  for wanted in FAIL WARN OK; do
+    for item in "${CONCLUSIONS[@]}"; do
+      type="${item%%|*}"
+      [[ "$type" == "$wanted" ]] || continue
+      text="${item#*|}"
+      case "$type" in
+        OK) ok "$text" ;;
+        WARN) warn "$text" ;;
+        FAIL) fail "$text" ;;
+      esac
+    done
+  done
+}
+
+print_dashboard() {
+  local os="" cpu_count="" mem_total="" mem_available="" disk_used=""
+  local latency="" download="" upload="" packet_loss=""
+  local mtr4_line="" mtr4_loss="" mtr4_avg="" mtr6_line="" mtr6_loss="" mtr6_avg=""
+  local port_count="" public_ports="" stress_status="" max_temp="" external_ipv4="" external_ipv6=""
+
+  os="$(sed -nE 's/^ОС:[[:space:]]+//p' "$SYS_REPORT" | head -n 1)"
+  cpu_count="$(sed -nE 's/^Логических CPU:[[:space:]]+//p' "$SYS_REPORT" | head -n 1)"
+  read -r mem_total mem_available < <(awk '/^Mem:/ {print $2, $7; exit}' "$SYS_REPORT")
+  disk_used="$(awk '$NF == "/" {print $(NF-1); exit}' "$SYS_REPORT")"
+
+  if [[ -s "$SPEED_REPORT" ]]; then
+    latency="$(sed -nE 's/.*Idle Latency:[[:space:]]*([0-9.]+).*/\1/p' "$SPEED_REPORT" | head -n 1)"
+    download="$(sed -nE 's/.*Download:[[:space:]]*([0-9.]+)[[:space:]]+Mbps.*/\1/p' "$SPEED_REPORT" | head -n 1)"
+    upload="$(sed -nE 's/.*Upload:[[:space:]]*([0-9.]+)[[:space:]]+Mbps.*/\1/p' "$SPEED_REPORT" | head -n 1)"
+    packet_loss="$(sed -nE 's/.*Packet Loss:[[:space:]]*([0-9.]+)%.*/\1/p' "$SPEED_REPORT" | head -n 1)"
+  fi
+
+  mtr4_line="$(awk 'NF >= 8 && $1 ~ /^[0-9]+\./ {last=$0} END {print last}' "$MTR4_REPORT" 2>/dev/null)"
+  mtr6_line="$(awk 'NF >= 8 && $1 ~ /^[0-9]+\./ {last=$0} END {print last}' "$MTR6_REPORT" 2>/dev/null)"
+  if [[ -n "$mtr4_line" ]]; then
+    mtr4_loss="$(awk '{v=$(NF-6); gsub(/%/, "", v); print v}' <<<"$mtr4_line")"
+    mtr4_avg="$(awk '{print $(NF-3)}' <<<"$mtr4_line")"
+  fi
+  if [[ -n "$mtr6_line" ]]; then
+    mtr6_loss="$(awk '{v=$(NF-6); gsub(/%/, "", v); print v}' <<<"$mtr6_line")"
+    mtr6_avg="$(awk '{print $(NF-3)}' <<<"$mtr6_line")"
+  fi
+
+  if grep -q '^Сетевые TCP-порты' "$PORTS_REPORT" 2>/dev/null; then
+    port_count="$(awk 'NR > 2 && NF {count++} END {print count+0}' "$PORTS_REPORT" 2>/dev/null)"
+    public_ports="$(awk '
+      NR > 2 {
+        address=$5
+        if (address ~ /^(0[.]0[.]0[.]0|\[::\]|[*]):/) {
+          sub(/^.*:/, "", address)
+          if (address ~ /^[0-9]+$/) print address
+        }
+      }
+    ' "$PORTS_REPORT" 2>/dev/null | sort -nu | paste -sd, -)"
+  else
+    port_count=""
+    public_ports=""
+  fi
+
+  if grep -q 'successful run completed' "$STRESS_REPORT" 2>/dev/null; then
+    stress_status="успешно, ${STRESS_SECONDS} сек."
+  elif [[ "$SKIP_STRESS" == "1" ]]; then
+    stress_status="отключён"
+  else
+    stress_status="нет успешного результата"
+  fi
+  max_temp="$(cat "$TEMP_MAX_FILE" 2>/dev/null || true)"
+
+  if jq -e . "$IPREGION_JSON" >/dev/null 2>&1; then
+    external_ipv4="$(jq -r '.ipv4 // "нет"' "$IPREGION_JSON")"
+    external_ipv6="$(jq -r '.ipv6 // "нет"' "$IPREGION_JSON")"
+  else
+    external_ipv4="нет данных"
+    external_ipv6="нет данных"
+  fi
+
+  printf '\n%s%sКЛЮЧЕВЫЕ ПОКАЗАТЕЛИ%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+  line
+  printf '%-20s %s\n' 'Система:' "${os:-нет данных}"
+  printf '%-20s %s vCPU | RAM %s, доступно %s | диск %s\n' \
+    'Ресурсы:' "${cpu_count:-?}" "${mem_total:-?}" "${mem_available:-?}" "${disk_used:-?}"
+  if [[ -n "$download" ]]; then
+    printf '%-20s ↓ %s Mbps | ↑ %s Mbps | ping %s ms | потери %s%%\n' \
+      'Speedtest:' "$download" "${upload:-?}" "${latency:-?}" "${packet_loss:-?}"
+  else
+    printf '%-20s %s\n' 'Speedtest:' 'нет результата'
+  fi
+  if [[ -n "${mtr4_avg:-}" ]]; then
+    printf '%-20s %s ms | потери %s%% | 25 пакетов\n' 'MTR IPv4:' "$mtr4_avg" "$mtr4_loss"
+  else
+    printf '%-20s %s\n' 'MTR IPv4:' 'нет результата'
+  fi
+  if [[ -n "${mtr6_avg:-}" ]]; then
+    printf '%-20s %s ms | потери %s%% | 25 пакетов\n' 'MTR IPv6:' "$mtr6_avg" "$mtr6_loss"
+  else
+    printf '%-20s %s\n' 'MTR IPv6:' 'маршрут отсутствует или тест не выполнен'
+  fi
+  if [[ "$port_count" =~ ^[0-9]+$ ]]; then
+    printf '%-20s %s сокетов | на всех интерфейсах: %s\n' \
+      'Порты:' "$port_count" "${public_ports:-нет}"
+  else
+    printf '%-20s %s\n' 'Порты:' 'нет результата'
+  fi
+  if [[ "$max_temp" =~ ^[0-9]+$ ]] && (( max_temp > 0 )); then
+    printf '%-20s %s | максимум %s°C\n' 'Нагрузка:' "$stress_status" "$max_temp"
+  else
+    printf '%-20s %s | температура недоступна\n' 'Нагрузка:' "$stress_status"
+  fi
+  printf '%-20s IPv4 %s | IPv6 %s\n' 'Внешние адреса:' "$external_ipv4" "$external_ipv6"
 }
 
 main() {
@@ -754,8 +900,13 @@ main() {
   else
     if run_spinner "Запускаем полный ipregion-тест" "$IPREGION_JSON" "$IPREGION_ERROR" run_ipregion; then
       if jq -e . "$IPREGION_JSON" >/dev/null 2>&1 && format_ipregion; then
-        ok "IP-регион и сервисы проверены."
-        add_ok "Проверка IP-региона и доступности сервисов завершена."
+        if ipregion_has_runtime_errors || ipregion_has_suspicious_values; then
+          warn "IP-регион проверен частично; есть ошибки отдельных запросов."
+          add_warn "Часть запросов ipregion завершилась ошибкой; ненадёжные значения отмечены в подробностях."
+        else
+          ok "IP-регион и сервисы проверены."
+          add_ok "Проверка IP-региона и доступности сервисов завершена без ошибок."
+        fi
       else
         fail "ipregion вернул некорректный JSON."
         cp "$IPREGION_JSON" "$IPREGION_REPORT"
@@ -774,6 +925,11 @@ main() {
 
   printf '\n%s%sФИНАЛЬНЫЙ ОТЧЁТ TIMURIO%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
   line
+  print_conclusions
+  print_dashboard
+
+  printf '\n%s%sПОДРОБНЫЕ РЕЗУЛЬТАТЫ%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+  line
   print_section "1. Система" "$SYS_REPORT"
   print_section "2. Ookla Speedtest" "$SPEED_REPORT"
   if [[ -s "$SPEED_ERROR" ]]; then print_section "Ошибки Speedtest" "$SPEED_ERROR"; fi
@@ -787,7 +943,6 @@ main() {
   if [[ -s "$KERNEL_NEW" ]]; then print_section "Новые сообщения ядра во время нагрузки" "$KERNEL_NEW"; fi
   print_section "7. IP-регион и доступность сервисов" "$IPREGION_REPORT"
   if [[ -s "$IPREGION_ERROR" ]]; then print_section "Сообщения ipregion" "$IPREGION_ERROR"; fi
-  print_conclusions
 
   printf '\n%sДиагностика завершена. Временные файлы будут удалены.%s\n' "$C_CYAN" "$C_RESET"
 }
