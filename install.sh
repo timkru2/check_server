@@ -5,8 +5,8 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="1.1.0"
-readonly TOTAL_STAGES=7ссс
+readonly SCRIPT_VERSION="1.1.1"
+readonly TOTAL_STAGES=7
 readonly SPEEDTEST_VERSION="1.2.0"
 readonly SPEEDTEST_X86_SHA256="5690596c54ff9bed63fa3732f818a05dbc2db19ad36ed68f21ca5f64d5cfeeb7"
 readonly SPEEDTEST_ARM_SHA256="3953d231da3783e2bf8904b6dd72767c5c6e533e163d3742fd0437affa431bd3"
