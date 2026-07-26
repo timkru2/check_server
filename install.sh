@@ -5,8 +5,8 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="1.2.0"
-readonly TOTAL_STAGES=7
+readonly SCRIPT_VERSION="1.3.0"
+readonly TOTAL_STAGES=6
 readonly SPEEDTEST_VERSION="1.2.0"
 readonly SPEEDTEST_X86_SHA256="5690596c54ff9bed63fa3732f818a05dbc2db19ad36ed68f21ca5f64d5cfeeb7"
 readonly SPEEDTEST_ARM_SHA256="3953d231da3783e2bf8904b6dd72767c5c6e533e163d3742fd0437affa431bd3"
@@ -16,16 +16,8 @@ readonly IPREGION_URL="https://raw.githubusercontent.com/vernette/ipregion/${IPR
 readonly GOOGLE_IPV4="8.8.8.8"
 readonly GOOGLE_IPV6="2001:4860:4860::8888"
 
-STRESS_SECONDS="${STRESS_SECONDS:-30}"
 AUTO_INSTALL="${AUTO_INSTALL:-1}"
-SKIP_STRESS="${SKIP_STRESS:-0}"
 SKIP_IPREGION="${SKIP_IPREGION:-0}"
-
-case "$STRESS_SECONDS" in
-  ''|*[!0-9]*) STRESS_SECONDS=30 ;;
-esac
-if (( STRESS_SECONDS < 10 )); then STRESS_SECONDS=10; fi
-if (( STRESS_SECONDS > 120 )); then STRESS_SECONDS=120; fi
 
 if [[ -t 1 && "${TERM:-dumb}" != "dumb" ]]; then
   C_RESET=$'\033[0m'
@@ -49,7 +41,6 @@ WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/timurio-diagnostics.XXXXXX")" || {
   printf 'Не удалось создать временный каталог.\n' >&2
   exit 1
 }
-LOAD_DIR=""
 ACTIVE_PID=0
 SYS_REPORT="$WORK_DIR/system.txt"
 DEPS_LOG="$WORK_DIR/dependencies.log"
@@ -60,34 +51,23 @@ MTR4_ERROR="$WORK_DIR/mtr4.err"
 MTR6_REPORT="$WORK_DIR/mtr6.txt"
 MTR6_ERROR="$WORK_DIR/mtr6.err"
 PORTS_REPORT="$WORK_DIR/ports.txt"
-STRESS_REPORT="$WORK_DIR/stress.txt"
-STRESS_ERROR="$WORK_DIR/stress.err"
-KERNEL_BEFORE="$WORK_DIR/kernel-before.txt"
-KERNEL_AFTER="$WORK_DIR/kernel-after.txt"
-KERNEL_NEW="$WORK_DIR/kernel-new.txt"
 IPREGION_JSON="$WORK_DIR/ipregion.json"
 IPREGION_ERROR="$WORK_DIR/ipregion.err"
 IPREGION_REPORT="$WORK_DIR/ipregion-report.txt"
 SSH_DATA="$WORK_DIR/ssh-data.txt"
-LOAD_DIR_FILE="$WORK_DIR/load-directory.txt"
 
 declare -a CONCLUSIONS=()
 
 cleanup() {
-  local path
   if [[ "$ACTIVE_PID" =~ ^[0-9]+$ ]] && (( ACTIVE_PID > 0 )); then
     kill "$ACTIVE_PID" 2>/dev/null || true
     wait "$ACTIVE_PID" 2>/dev/null || true
   fi
-  if [[ -s "$LOAD_DIR_FILE" ]]; then
-    read -r LOAD_DIR <"$LOAD_DIR_FILE" || LOAD_DIR=""
-  fi
-  for path in "$LOAD_DIR" "$WORK_DIR"; do
-    [[ -n "$path" && -d "$path" ]] || continue
-    case "$path" in
-      /tmp/timurio-*|/var/tmp/timurio-*|"${TMPDIR:-/tmp}"/timurio-*) rm -rf -- "$path" ;;
+  if [[ -d "$WORK_DIR" ]]; then
+    case "$WORK_DIR" in
+      /tmp/timurio-*|"${TMPDIR:-/tmp}"/timurio-*) rm -rf -- "$WORK_DIR" ;;
     esac
-  done
+  fi
 }
 trap cleanup EXIT
 trap 'printf "\nДиагностика прервана.\n" >&2; exit 130' INT TERM
@@ -191,7 +171,6 @@ install_dependencies() {
   local manager=""
   local need_core=0
   local need_ipregion=0
-  local need_stress=0
   local rc=0
   local cmd
 
@@ -203,9 +182,7 @@ install_dependencies() {
   for cmd in curl jq nslookup column; do
     if command_missing "$cmd"; then need_ipregion=1; fi
   done
-  if [[ "$SKIP_STRESS" != "1" ]] && command_missing stress-ng; then need_stress=1; fi
-
-  if (( need_core == 0 && need_ipregion == 0 && need_stress == 0 )); then
+  if (( need_core == 0 && need_ipregion == 0 )); then
     return 0
   fi
   if [[ "$AUTO_INSTALL" != "1" ]]; then
@@ -229,19 +206,12 @@ install_dependencies() {
           ca-certificates wget curl tar coreutils gawk sed grep iproute2 mtr-tiny \
           jq dnsutils util-linux bsdextrautils >>"$DEPS_LOG" 2>&1 || rc=1
       fi
-      if (( need_stress )); then
-        pkg_exec env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq stress-ng \
-          >>"$DEPS_LOG" 2>&1 || true
-      fi
       ;;
     dnf|yum)
       if (( need_core || need_ipregion )); then
         pkg_exec "$manager" install -y -q \
           ca-certificates wget curl tar coreutils gawk sed grep iproute mtr \
           jq bind-utils util-linux >>"$DEPS_LOG" 2>&1 || rc=1
-      fi
-      if (( need_stress )); then
-        pkg_exec "$manager" install -y -q stress-ng >>"$DEPS_LOG" 2>&1 || true
       fi
       ;;
     apk)
@@ -250,9 +220,6 @@ install_dependencies() {
           ca-certificates wget curl tar coreutils gawk sed grep iproute2 mtr \
           jq bind-tools util-linux >>"$DEPS_LOG" 2>&1 || rc=1
       fi
-      if (( need_stress )); then
-        pkg_exec apk add --no-cache stress-ng >>"$DEPS_LOG" 2>&1 || true
-      fi
       ;;
     pacman)
       if (( need_core || need_ipregion )); then
@@ -260,18 +227,12 @@ install_dependencies() {
           ca-certificates wget curl tar coreutils gawk sed grep iproute2 mtr \
           jq bind util-linux >>"$DEPS_LOG" 2>&1 || rc=1
       fi
-      if (( need_stress )); then
-        pkg_exec pacman -S --noconfirm --needed stress-ng >>"$DEPS_LOG" 2>&1 || true
-      fi
       ;;
     zypper)
       if (( need_core || need_ipregion )); then
         pkg_exec zypper --non-interactive install \
           ca-certificates wget curl tar coreutils gawk sed grep iproute2 mtr \
           jq bind-utils util-linux >>"$DEPS_LOG" 2>&1 || rc=1
-      fi
-      if (( need_stress )); then
-        pkg_exec zypper --non-interactive install stress-ng >>"$DEPS_LOG" 2>&1 || true
       fi
       ;;
   esac
@@ -589,76 +550,6 @@ analyze_ssh() {
   fi
 }
 
-run_stress_test() {
-  local available_kb hdd_mb=0 stress_pid=0 rc
-  local -a args
-
-  command -v stress-ng >/dev/null 2>&1 || {
-    printf 'stress-ng не установлен.\n' >&2
-    return 127
-  }
-
-  LOAD_DIR="$(mktemp -d /var/tmp/timurio-load.XXXXXX 2>/dev/null || mktemp -d "${TMPDIR:-/tmp}/timurio-load.XXXXXX")" || return 1
-  printf '%s\n' "$LOAD_DIR" >"$LOAD_DIR_FILE"
-  available_kb="$(df -Pk "$LOAD_DIR" | awk 'NR==2 {print $4}')"
-  if [[ "$available_kb" =~ ^[0-9]+$ ]] && (( available_kb >= 1048576 )); then
-    hdd_mb=256
-  fi
-
-  args=(--cpu 0 --cpu-method all --vm 1 --vm-bytes 25% --timeout "${STRESS_SECONDS}s" --metrics-brief --verify)
-  if (( hdd_mb > 0 )); then
-    args+=(--hdd 1 --hdd-bytes "${hdd_mb}M" --temp-path "$LOAD_DIR")
-  fi
-
-  stress-ng "${args[@]}" >"$WORK_DIR/stress-raw.txt" 2>&1 &
-  stress_pid=$!
-  trap 'if (( stress_pid > 0 )); then kill "$stress_pid" 2>/dev/null || true; wait "$stress_pid" 2>/dev/null || true; fi; case "$LOAD_DIR" in /tmp/timurio-*|/var/tmp/timurio-*) rm -rf -- "$LOAD_DIR" ;; esac; exit 130' INT TERM
-  wait "$stress_pid"
-  rc=$?
-
-  printf 'Параметры: CPU=%s потоков, RAM=25%%, диск=%s MiB, время=%s сек.\n\n' \
-    "$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '?')" "$hdd_mb" "$STRESS_SECONDS"
-  cat "$WORK_DIR/stress-raw.txt"
-  case "$LOAD_DIR" in
-    /tmp/timurio-*|/var/tmp/timurio-*) rm -rf -- "$LOAD_DIR" ;;
-  esac
-  LOAD_DIR=""
-  : >"$LOAD_DIR_FILE"
-  trap - INT TERM
-  return "$rc"
-}
-
-capture_dmesg() {
-  local target="$1"
-  if command -v dmesg >/dev/null 2>&1; then
-    dmesg 2>/dev/null >"$target" || : >"$target"
-  else
-    : >"$target"
-  fi
-}
-
-analyze_stress() {
-  local stress_rc="${1:-0}"
-  local before_lines=0
-
-  if grep -Eqi 'fail(ed|ure)?|error|miscompare|out of memory|oom|killed process|hardware error|i/o error' "$STRESS_REPORT" "$STRESS_ERROR" 2>/dev/null; then
-    add_fail "Нагрузочный тест сообщил об ошибке; подробности приведены в его разделе."
-  elif [[ "$stress_rc" == "0" ]]; then
-    add_ok "Проверка процессора, памяти и диска завершилась без ошибок."
-  fi
-
-  capture_dmesg "$KERNEL_AFTER"
-  before_lines="$(wc -l <"$KERNEL_BEFORE" 2>/dev/null || printf '0')"
-  if [[ "$before_lines" =~ ^[0-9]+$ ]] && (( before_lines > 0 )); then
-    tail -n "+$((before_lines + 1))" "$KERNEL_AFTER" >"$KERNEL_NEW" 2>/dev/null || : >"$KERNEL_NEW"
-  else
-    : >"$KERNEL_NEW"
-  fi
-  if grep -Eqi 'out of memory|oom-killer|killed process|hardware error|i/o error|segfault|mce:' "$KERNEL_NEW" 2>/dev/null; then
-    add_fail "Во время нагрузки ядро зафиксировало серьёзную ошибку; сообщения приведены ниже."
-  fi
-}
-
 curl_supports_json() {
   curl --help all 2>/dev/null | grep -q -- '--json'
 }
@@ -725,29 +616,6 @@ ipregion_has_suspicious_values() {
     ]
     | length > 0
   ' "$IPREGION_JSON" >/dev/null 2>&1
-}
-
-print_stress_summary() {
-  printf '\n%s%s%s\n' "$C_BOLD" 'ПРОВЕРКА НАГРУЗКИ' "$C_RESET"
-  line
-
-  if [[ "$SKIP_STRESS" == "1" ]]; then
-    printf 'Результат: тест отключён.\n'
-    return
-  fi
-  if grep -q 'successful run completed' "$STRESS_REPORT" 2>/dev/null; then
-    printf 'Результат: успешно, отклонений не обнаружено.\n'
-  else
-    printf 'Результат: тест не завершился успешно. Смотрите итог диагностики выше.\n'
-  fi
-  printf 'Что проверено: процессор, оперативная память и диск.\n'
-  printf 'Продолжительность: %s секунд.\n' "$STRESS_SECONDS"
-
-  if grep -Eqi 'out of memory|oom-killer|killed process|hardware error|i/o error|segfault|mce:' "$KERNEL_NEW" 2>/dev/null; then
-    printf 'Сообщения ядра: обнаружена критическая ошибка; описание приведено в итоге диагностики.\n'
-  else
-    printf 'Сообщения ядра: критических ошибок во время нагрузки не обнаружено.\n'
-  fi
 }
 
 print_ssh_summary() {
@@ -841,7 +709,7 @@ print_dashboard() {
   local os="" cpu_count="" mem_total="" mem_available="" disk_used=""
   local latency="" download="" upload="" packet_loss=""
   local mtr4_line="" mtr4_loss="" mtr4_avg="" mtr6_line="" mtr6_loss="" mtr6_avg=""
-  local port_count="" public_ports="" stress_status="" external_ipv4="" external_ipv6=""
+  local port_count="" public_ports="" external_ipv4="" external_ipv6=""
 
   os="$(sed -nE 's/^ОС:[[:space:]]+//p' "$SYS_REPORT" | head -n 1)"
   cpu_count="$(sed -nE 's/^Логических CPU:[[:space:]]+//p' "$SYS_REPORT" | head -n 1)"
@@ -882,13 +750,6 @@ print_dashboard() {
     public_ports=""
   fi
 
-  if grep -q 'successful run completed' "$STRESS_REPORT" 2>/dev/null; then
-    stress_status="успешно, ${STRESS_SECONDS} сек."
-  elif [[ "$SKIP_STRESS" == "1" ]]; then
-    stress_status="отключён"
-  else
-    stress_status="нет успешного результата"
-  fi
   if jq -e . "$IPREGION_JSON" >/dev/null 2>&1; then
     external_ipv4="$(jq -r '.ipv4 // "нет"' "$IPREGION_JSON")"
     external_ipv6="$(jq -r '.ipv6 // "нет"' "$IPREGION_JSON")"
@@ -924,7 +785,6 @@ print_dashboard() {
   else
     printf 'Сетевые порты: нет результата\n'
   fi
-  printf 'Проверка нагрузки: %s\n' "$stress_status"
   printf 'Внешний адрес: IPv4 %s | IPv6 %s\n' "$external_ipv4" "$external_ipv6"
 }
 
@@ -1005,29 +865,7 @@ main() {
   collect_ssh_info
   analyze_ssh
 
-  stage 6 "Контролируемая нагрузка CPU, RAM и диска"
-  if [[ "$SKIP_STRESS" == "1" ]]; then
-    printf 'Тест отключён переменной SKIP_STRESS=1.\n' >"$STRESS_REPORT"
-    warn "Нагрузочный тест отключён."
-    add_warn "Нагрузочный тест был отключён пользователем."
-  elif ! command -v stress-ng >/dev/null 2>&1; then
-    printf 'stress-ng отсутствует.\n' >"$STRESS_ERROR"
-    warn "Не удалось подготовить проверку нагрузки."
-    add_warn "Проверка нагрузки пропущена: необходимая утилита недоступна."
-  else
-    capture_dmesg "$KERNEL_BEFORE"
-    if run_spinner "Нагружаем ВМ ${STRESS_SECONDS} секунд" "$STRESS_REPORT" "$STRESS_ERROR" run_stress_test; then
-      ok "Нагрузочный тест завершён."
-      analyze_stress 0
-    else
-      rc=$?
-      fail "Нагрузочный тест завершился с ошибкой (код $rc)."
-      add_fail "Проверка нагрузки завершилась с ошибкой."
-      analyze_stress "$rc"
-    fi
-  fi
-
-  stage 7 "IP-регион и доступность интернет-сервисов"
+  stage 6 "IP-регион и доступность интернет-сервисов"
   if [[ "$SKIP_IPREGION" == "1" ]]; then
     printf 'Тест отключён переменной SKIP_IPREGION=1.\n' >"$IPREGION_REPORT"
     warn "Проверка региона и сервисов отключена."
@@ -1063,7 +901,6 @@ main() {
   print_conclusions
   print_dashboard
   print_ssh_summary
-  print_stress_summary
   print_services_summary
 
   printf '\n%sДиагностика завершена. Временные файлы будут удалены.%s\n' "$C_CYAN" "$C_RESET"
